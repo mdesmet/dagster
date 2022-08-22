@@ -85,6 +85,7 @@ def main(quiet: bool, extra_packages: List[str]) -> None:
             "-e python_modules/libraries/dagster-pandera",
             "-e python_modules/libraries/dagster-snowflake",
             "-e python_modules/libraries/dagster-snowflake-pandas",
+            "-e python_modules/libraries/dagster-trino",
         ]
 
     if sys.version_info > (3, 6) and sys.version_info < (3, 10):
