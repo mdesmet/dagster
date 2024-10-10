@@ -31,13 +31,14 @@ const getDocumentTitle = (selected: ReturnType<typeof useSelectedRunsFeedTab>) =
   }
 };
 
-export const useRunsFeedTabs = (filter: RunsFilter = {}) => {
+export const useRunsFeedTabs = (filter: RunsFilter = {}, includeRunsFromBackfills: boolean) => {
   const queryResult = useQuery<RunFeedTabsCountQuery, RunFeedTabsCountQueryVariables>(
     RUN_FEED_TABS_COUNT_QUERY,
     {
       variables: {
         queuedFilter: {...filter, statuses: Array.from(queuedStatuses)},
         inProgressFilter: {...filter, statuses: Array.from(inProgressStatuses)},
+        includeRunsFromBackfills,
       },
     },
   );
@@ -46,9 +47,11 @@ export const useRunsFeedTabs = (filter: RunsFilter = {}) => {
   const {queuedCount, inProgressCount} = useMemo(() => {
     return {
       queuedCount:
-        countData?.queuedCount?.__typename === 'Runs' ? countData.queuedCount.count : null,
+        countData?.queuedCount?.__typename === 'RunsFeedCount' ? countData.queuedCount.count : null,
       inProgressCount:
-        countData?.inProgressCount?.__typename === 'Runs' ? countData.inProgressCount.count : null,
+        countData?.inProgressCount?.__typename === 'RunsFeedCount'
+          ? countData.inProgressCount.count
+          : null,
     };
   }, [countData]);
 
@@ -60,7 +63,11 @@ export const useRunsFeedTabs = (filter: RunsFilter = {}) => {
   const urlForStatus = (statuses: RunStatus[]) => {
     const tokensMinusStatus = filterTokens.filter((token) => token.token !== 'status');
     const statusTokens = statuses.map((status) => ({token: 'status' as const, value: status}));
-    return runsPathWithFilters([...statusTokens, ...tokensMinusStatus], getRunFeedPath());
+    return runsPathWithFilters(
+      [...statusTokens, ...tokensMinusStatus],
+      getRunFeedPath(),
+      includeRunsFromBackfills,
+    );
   };
 
   const tabs = (
@@ -77,7 +84,13 @@ export const useRunsFeedTabs = (filter: RunsFilter = {}) => {
         to={urlForStatus(Array.from(inProgressStatuses))}
       />
       <TabLink id="failed" title="Failed" to={urlForStatus(Array.from(failedStatuses))} />
-      <TabLink id="scheduled" title="Scheduled" to={`${getRunFeedPath()}/scheduled`} />
+      <TabLink
+        id="scheduled"
+        title="Scheduled"
+        to={`${getRunFeedPath()}scheduled?${
+          includeRunsFromBackfills ? 'show_runs_within_backfills=true' : ''
+        }`}
+      />
     </Tabs>
   );
 
@@ -109,7 +122,7 @@ export const ActivatableButton = styled(AnchorButton)<{$active: boolean}>`
 
 export const useSelectedRunsFeedTab = (filterTokens: TokenizingFieldValue[]) => {
   const {pathname} = useLocation();
-  if (pathname === `${getRunFeedPath()}/scheduled`) {
+  if (pathname === `${getRunFeedPath()}scheduled`) {
     return 'scheduled';
   }
   const statusTokens = new Set(
@@ -128,14 +141,24 @@ export const useSelectedRunsFeedTab = (filterTokens: TokenizingFieldValue[]) => 
 };
 
 export const RUN_FEED_TABS_COUNT_QUERY = gql`
-  query RunFeedTabsCountQuery($queuedFilter: RunsFilter!, $inProgressFilter: RunsFilter!) {
-    queuedCount: pipelineRunsOrError(filter: $queuedFilter) {
-      ... on Runs {
+  query RunFeedTabsCountQuery(
+    $queuedFilter: RunsFilter!
+    $inProgressFilter: RunsFilter!
+    $includeRunsFromBackfills: Boolean!
+  ) {
+    queuedCount: runsFeedCountOrError(
+      filter: $queuedFilter
+      includeRunsFromBackfills: $includeRunsFromBackfills
+    ) {
+      ... on RunsFeedCount {
         count
       }
     }
-    inProgressCount: pipelineRunsOrError(filter: $inProgressFilter) {
-      ... on Runs {
+    inProgressCount: runsFeedCountOrError(
+      filter: $inProgressFilter
+      includeRunsFromBackfills: $includeRunsFromBackfills
+    ) {
+      ... on RunsFeedCount {
         count
       }
     }

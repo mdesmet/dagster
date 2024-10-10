@@ -31,7 +31,7 @@ class PipesS3MessageReader(PipesBlobStoreMessageReader):
         interval (float): interval in seconds between attempts to download a chunk
         bucket (str): The S3 bucket to read from.
         client (WorkspaceClient): A boto3 client.
-        log_readers (Optional[Sequence[PipesLogReader]]): A set of readers for logs on S3.
+        log_readers (Optional[Sequence[PipesLogReader]]): A set of log readers for logs on S3.
     """
 
     def __init__(
@@ -53,6 +53,17 @@ class PipesS3MessageReader(PipesBlobStoreMessageReader):
     def get_params(self) -> Iterator[PipesParams]:
         key_prefix = "".join(random.choices(string.ascii_letters, k=30))
         yield {"bucket": self.bucket, "key_prefix": key_prefix}
+
+    def messages_are_readable(self, params: PipesParams) -> bool:
+        key_prefix = params.get("key_prefix")
+        if key_prefix is not None:
+            try:
+                self.client.head_object(Bucket=self.bucket, Key=f"{key_prefix}/1.json")
+                return True
+            except ClientError:
+                return False
+        else:
+            return False
 
     def download_messages_chunk(self, index: int, params: PipesParams) -> Optional[str]:
         key = f"{params['key_prefix']}/{index}.json"

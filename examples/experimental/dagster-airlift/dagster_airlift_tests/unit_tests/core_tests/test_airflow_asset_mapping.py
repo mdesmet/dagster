@@ -1,27 +1,27 @@
+import datetime
 from typing import List
 
 from dagster._core.definitions.asset_key import AssetKey, CoercibleToAssetKey
 from dagster._core.definitions.asset_spec import AssetSpec
 from dagster._core.definitions.definitions_class import Definitions
 from dagster_airlift.constants import TASK_MAPPING_METADATA_KEY
-from dagster_airlift.core.airflow_instance import DagInfo, TaskInfo
+from dagster_airlift.core.airflow_defs_data import AirflowDefinitionsData
+from dagster_airlift.core.airflow_instance import DagInfo
+from dagster_airlift.core.load_defs import build_full_automapped_dags_from_airflow_instance
 from dagster_airlift.core.serialization.compute import (
     FetchedAirflowData,
     TaskHandle,
     build_airlift_metadata_mapping_info,
     fetch_all_airflow_data,
 )
+from dagster_airlift.core.serialization.serialized_data import TaskInfo
 from dagster_airlift.core.utils import metadata_for_task_mapping
-from dagster_airlift.migration_state import (
-    AirflowMigrationState,
-    DagMigrationState,
-    TaskMigrationState,
-)
 from dagster_airlift.test import AirflowInstanceFake
+from dagster_airlift.test.airflow_test_instance import make_dag_run, make_instance
 
 
 def ak(key: str) -> AssetKey:
-    return AssetKey(key)
+    return AssetKey.from_user_string(key)
 
 
 def airlift_asset_spec(key: CoercibleToAssetKey, dag_id: str, task_id: str) -> AssetSpec:
@@ -40,7 +40,6 @@ def test_build_task_mapping_info_no_mapping() -> None:
     spec_mapping_info = build_airlift_metadata_mapping_info(
         defs=Definitions(assets=[AssetSpec("asset1"), AssetSpec("asset2")])
     )
-    assert len(spec_mapping_info.asset_keys) == 2
     assert len(spec_mapping_info.dag_ids) == 0
     assert not (spec_mapping_info.asset_key_map)
     assert not (spec_mapping_info.task_handle_map)
@@ -145,16 +144,6 @@ def test_fetched_airflow_data() -> None:
                 ),
             }
         },
-        migration_state=AirflowMigrationState(
-            dags={
-                "dag1": DagMigrationState(
-                    {
-                        "task1": TaskMigrationState(task_id="task1", migrated=True),
-                        "task2": TaskMigrationState(task_id="task2", migrated=False),
-                    }
-                )
-            },
-        ),
         mapping_info=build_airlift_metadata_mapping_info(
             defs=Definitions(
                 assets=[
@@ -165,17 +154,19 @@ def test_fetched_airflow_data() -> None:
         ),
     )
 
-    assert fetched_airflow_data.migration_state_map == {"dag1": {"task1": True, "task2": False}}
-
-    airflow_data_by_key = fetched_airflow_data.airflow_data_by_key
-    assert airflow_data_by_key.keys() == {ak("asset1"), ak("asset2")}
-
-    assert "Dag ID" in fetched_airflow_data.airflow_data_by_key[ak("asset1")].additional_metadata
+    all_mapped_tasks = fetched_airflow_data.all_mapped_tasks
+    assert all_mapped_tasks.keys() == {ak("asset1"), ak("asset2")}
+    assert all_mapped_tasks[ak("asset1")] == {TaskHandle(dag_id="dag1", task_id="task1")}
 
 
 def test_produce_fetched_airflow_data() -> None:
     mapping_info = build_airlift_metadata_mapping_info(
-        defs=Definitions(assets=[airlift_asset_spec("asset1", "dag1", "task1")])
+        defs=Definitions(
+            assets=[
+                airlift_asset_spec("asset1", "dag1", "task1"),
+                AssetSpec("asset2", deps=[ak("asset1")]),
+            ]
+        )
     )
 
     instance = AirflowInstanceFake(
@@ -204,3 +195,29 @@ def test_produce_fetched_airflow_data() -> None:
     )
 
     assert len(fetched_airflow_data.mapping_info.mapped_asset_specs) == 1
+    assert len(fetched_airflow_data.mapping_info.asset_specs) == 2
+    assert fetched_airflow_data.mapping_info.downstream_deps == {ak("asset1"): {ak("asset2")}}
+
+
+def test_automapped_loaded_data() -> None:
+    airflow_instance = make_instance(
+        dag_and_task_structure={"dag1": ["task1", "task2"]},
+        dag_runs=[
+            make_dag_run(
+                dag_id="dag1",
+                run_id="run1",
+                start_date=datetime.datetime.now(),
+                end_date=datetime.datetime.now(),
+            ),
+        ],
+        task_deps={"task1": ["task2"]},
+        instance_name="test_instance",
+    )
+
+    defs = build_full_automapped_dags_from_airflow_instance(
+        airflow_instance=airflow_instance,
+    )
+
+    airflow_data = AirflowDefinitionsData(airflow_instance=airflow_instance, mapped_defs=defs)
+
+    assert airflow_data.task_ids_in_dag("dag1") == {"task1", "task2"}

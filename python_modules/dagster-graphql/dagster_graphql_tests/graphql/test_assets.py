@@ -105,6 +105,9 @@ WIPE_ASSETS = """
             ... on UnsupportedOperationError {
               message
             }
+            ... on AssetNotFoundError {
+              message
+            }
             ... on AssetWipeSuccess {
                 assetPartitionRanges {
                     assetKey {
@@ -367,6 +370,18 @@ GET_AUTO_MATERIALIZE_POLICY = """
             id
             autoMaterializePolicy {
                 policyType
+            }
+        }
+    }
+"""
+
+GET_AUTOMATION_CONDITION = """
+    query AssetNodeQuery {
+        assetNodes {
+            id
+            automationCondition {
+                label
+                expandedLabel
             }
         }
     }
@@ -2595,6 +2610,22 @@ class TestAssetAwareEventLog(ExecutingGraphQLContextTestMatrix):
         assert len(fresh_diamond_bottom) == 1
         assert fresh_diamond_bottom[0]["autoMaterializePolicy"]["policyType"] == "LAZY"
 
+    def test_automation_condition(self, graphql_context: WorkspaceRequestContext):
+        result = execute_dagster_graphql(graphql_context, GET_AUTOMATION_CONDITION)
+
+        assert result.data
+        assert result.data["assetNodes"]
+
+        automation_condition_asset = [
+            a
+            for a in result.data["assetNodes"]
+            if a["id"] == 'test.test_repo.["asset_with_automation_condition"]'
+        ]
+        assert len(automation_condition_asset) == 1
+        condition = automation_condition_asset[0]["automationCondition"]
+        assert condition["label"] == "eager"
+        assert "(in_latest_time_window)" in condition["expandedLabel"]
+
     def test_tags(self, graphql_context: WorkspaceRequestContext):
         result = execute_dagster_graphql(
             graphql_context,
@@ -2837,6 +2868,25 @@ class TestAssetWipe(ExecutingGraphQLContextTestMatrix):
         assert result.data["wipeAssets"]["__typename"] == "UnsupportedOperationError"
         assert "Partitioned asset wipe is not supported yet" in result.data["wipeAssets"]["message"]
 
+        # wipe for non-existant asset
+        result = execute_dagster_graphql(
+            graphql_context,
+            WIPE_ASSETS,
+            variables={
+                "assetPartitionRanges": [
+                    {
+                        "assetKey": {"path": ["does_not_exist"]},
+                        "partitions": {"range": {"start": "0", "end": "0"}},
+                    }
+                ]
+            },
+        )
+
+        assert result.data
+        assert result.data["wipeAssets"]
+        assert result.data["wipeAssets"]["__typename"] == "AssetNotFoundError"
+        assert 'Asset key ["does_not_exist"] not found' in result.data["wipeAssets"]["message"]
+
 
 class TestAssetEventsReadOnly(ReadonlyGraphQLContextTestMatrix):
     def test_report_runless_asset_events_permissions(
@@ -2991,7 +3041,7 @@ class TestPersistentInstanceAssetInProgress(ExecutingGraphQLContextTestMatrix):
         # Create two enqueued runs
         code_location = graphql_context.get_code_location("test")
         repository = code_location.get_repository("test_repo")
-        job = repository.get_full_external_job("hanging_job")
+        job = repository.get_full_job("hanging_job")
 
         queued_runs = []
 

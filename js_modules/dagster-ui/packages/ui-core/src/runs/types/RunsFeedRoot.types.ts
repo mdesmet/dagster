@@ -6,6 +6,7 @@ export type RunsFeedRootQueryVariables = Types.Exact<{
   limit: Types.Scalars['Int']['input'];
   cursor?: Types.InputMaybe<Types.Scalars['String']['input']>;
   filter?: Types.InputMaybe<Types.RunsFilter>;
+  includeRunsFromBackfills: Types.Scalars['Boolean']['input'];
 }>;
 
 export type RunsFeedRootQuery = {
@@ -78,6 +79,7 @@ export type RunsFeedRootQuery = {
               status: Types.RunStatus;
               pipelineName: string;
               pipelineSnapshotId: string | null;
+              hasRunMetricsEnabled: boolean;
               repositoryOrigin: {
                 __typename: 'RepositoryOrigin';
                 id: string;
@@ -96,4 +98,4 @@ export type RunsFeedRootQuery = {
       };
 };
 
-export const RunsFeedRootQueryVersion = '42006dc8a4bc222d1ef7fe3275fd64769ab2645efacfb3432edc9616bb88d826';
+export const RunsFeedRootQueryVersion = 'ef8eb6ca144d661c6bcd409ed878551851f15dd1c0aa8c03ee9c68c1c4c301d1';

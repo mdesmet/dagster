@@ -1,49 +1,51 @@
 from functools import cached_property
-from typing import AbstractSet, Any, List, Mapping, Optional, Sequence
+from typing import AbstractSet, Any, Dict, List, Mapping, NamedTuple, Set
 
-from dagster import AssetDep, AssetKey, AssetSpec
+from dagster import (
+    AssetKey,
+    _check as check,
+)
 from dagster._record import record
 from dagster._serdes import whitelist_for_serdes
-from dagster._utils.merger import merge_dicts
 
 
-###################################################################################################
-# Data for reconstructing AssetSpecs from serialized data.
-###################################################################################################
-# History:
-# - created
 @whitelist_for_serdes
 @record
-class SerializedAssetSpecData:
-    """Serializable data that can be used to construct a fully qualified AssetSpec."""
+class TaskInfo:
+    webserver_url: str
+    dag_id: str
+    task_id: str
+    metadata: Dict[str, Any]
 
-    asset_key: AssetKey
-    description: Optional[str]
-    metadata: Mapping[str, Any]
-    tags: Mapping[str, str]
-    deps: Sequence["SerializedAssetDepData"]
+    @property
+    def dag_url(self) -> str:
+        return f"{self.webserver_url}/dags/{self.dag_id}"
 
-    def to_asset_spec(self) -> AssetSpec:
-        return AssetSpec(
-            key=self.asset_key,
-            description=self.description,
-            metadata=self.metadata,
-            tags=self.tags,
-            deps=[AssetDep(asset=dep.asset_key) for dep in self.deps] if self.deps else [],
-        )
+    @cached_property
+    def downstream_task_ids(self) -> List[str]:
+        return check.is_list(self.metadata["downstream_task_ids"], str)
 
 
-# History:
-# - created
 @whitelist_for_serdes
 @record
-class SerializedAssetDepData:
-    # A dumbed down version of AssetDep that can be serialized easily to and from a dictionary.
-    asset_key: AssetKey
+class DagInfo:
+    webserver_url: str
+    dag_id: str
+    metadata: Dict[str, Any]
 
-    @staticmethod
-    def from_asset_dep(asset_dep: AssetDep) -> "SerializedAssetDepData":
-        return SerializedAssetDepData(asset_key=asset_dep.asset_key)
+    @property
+    def url(self) -> str:
+        return f"{self.webserver_url}/dags/{self.dag_id}"
+
+    @property
+    def file_token(self) -> str:
+        return self.metadata["file_token"]
+
+
+@whitelist_for_serdes
+class TaskHandle(NamedTuple):
+    dag_id: str
+    task_id: str
 
 
 ###################################################################################################
@@ -57,16 +59,17 @@ class SerializedDagData:
     """A record containing pre-computed data about a given airflow dag."""
 
     dag_id: str
-    spec_data: SerializedAssetSpecData
-    task_handle_data: Mapping[str, "SerializedTaskHandleData"]
-    all_asset_keys_in_tasks: AbstractSet[AssetKey]
+    dag_info: DagInfo
+    source_code: str
+    leaf_asset_keys: Set[AssetKey]
+    task_infos: Mapping[str, TaskInfo]
 
 
 @whitelist_for_serdes
 @record
 class KeyScopedDataItem:
     asset_key: AssetKey
-    data: "SerializedAssetKeyScopedAirflowData"
+    mapped_tasks: AbstractSet[TaskHandle]
 
 
 ###################################################################################################
@@ -77,44 +80,14 @@ class KeyScopedDataItem:
 # - created
 # - removed existing_asset_data
 # - added key_scope_data_items
+# - added instance_name
 @whitelist_for_serdes
 @record
 class SerializedAirflowDefinitionsData:
+    instance_name: str
     key_scoped_data_items: List[KeyScopedDataItem]
     dag_datas: Mapping[str, SerializedDagData]
-    asset_key_topological_ordering: Sequence[AssetKey]
 
     @cached_property
-    def key_scope_data_map(self) -> Mapping[AssetKey, "SerializedAssetKeyScopedAirflowData"]:
-        return {item.asset_key: item.data for item in self.key_scoped_data_items}
-
-
-# History:
-# - created
-@whitelist_for_serdes
-@record
-class SerializedTaskHandleData:
-    """A record containing known data about a given airflow task handle."""
-
-    migration_state: Optional[bool]
-    asset_keys_in_task: AbstractSet[AssetKey]
-
-
-# History:
-# - created
-@whitelist_for_serdes
-@record
-class SerializedAssetKeyScopedAirflowData:
-    """Additional data retrieved from airflow that once over the serialization boundary, we can combine with the original asset spec."""
-
-    additional_metadata: Mapping[str, Any]
-    additional_tags: Mapping[str, str]
-
-    def apply_to_spec(self, spec: AssetSpec) -> AssetSpec:
-        return AssetSpec(
-            key=spec.key,
-            description=spec.description,
-            metadata=merge_dicts(spec.metadata, self.additional_metadata),
-            tags=merge_dicts(spec.tags, self.additional_tags),
-            deps=spec.deps,
-        )
+    def all_mapped_tasks(self) -> Dict[AssetKey, AbstractSet[TaskHandle]]:
+        return {item.asset_key: item.mapped_tasks for item in self.key_scoped_data_items}

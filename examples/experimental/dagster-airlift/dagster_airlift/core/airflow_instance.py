@@ -1,24 +1,16 @@
 import datetime
-import json
 import time
 from abc import ABC
-from functools import cached_property
 from typing import Any, Dict, List, Sequence
 
 import requests
-from dagster._core.definitions.asset_key import AssetKey
+from dagster import _check as check
+from dagster._core.definitions.utils import check_valid_name
 from dagster._core.errors import DagsterError
 from dagster._record import record
 from dagster._time import get_current_datetime
 
-from dagster_airlift.migration_state import (
-    AirflowMigrationState,
-    DagMigrationState,
-    load_migration_state_from_yaml,
-)
-from dagster_airlift.utils import get_local_migration_state_dir
-
-from .utils import convert_to_valid_dagster_name
+from dagster_airlift.core.serialization.serialized_data import DagInfo, TaskInfo
 
 TERMINAL_STATES = {"success", "failed", "skipped", "up_for_retry", "up_for_reschedule"}
 # This limits the number of task ids that we attempt to query from airflow's task instance rest API at a given time.
@@ -49,7 +41,7 @@ class AirflowInstance:
         batch_dag_runs_limit: int = DEFAULT_BATCH_DAG_RUNS_LIMIT,
     ) -> None:
         self.auth_backend = auth_backend
-        self.name = name
+        self.name = check_valid_name(name)
         self.batch_task_instance_limit = batch_task_instance_limit
         self.batch_dag_runs_limit = batch_dag_runs_limit
 
@@ -86,19 +78,6 @@ class AirflowInstance:
             raise DagsterError(
                 "Failed to fetch variables. Status code: {response.status_code}, Message: {response.text}"
             )
-
-    def get_migration_state(self) -> AirflowMigrationState:
-        local_migration_dir = get_local_migration_state_dir()
-        if local_migration_dir is not None:
-            return load_migration_state_from_yaml(local_migration_dir)
-        variables = self.list_variables()
-        dag_dict = {}
-        for var_dict in variables:
-            if var_dict["key"].endswith("_dagster_migration_state"):
-                dag_id = var_dict["key"].replace("_dagster_migration_state", "")
-                migration_dict = json.loads(var_dict["value"])
-                dag_dict[dag_id] = DagMigrationState.from_dict(migration_dict)
-        return AirflowMigrationState(dags=dag_dict)
 
     def get_task_instance_batch(
         self, dag_id: str, task_ids: Sequence[str], run_id: str, states: Sequence[str]
@@ -201,18 +180,14 @@ class AirflowInstance:
                 f"Failed to fetch source code. Status code: {response.status_code}, Message: {response.text}"
             )
 
-    @staticmethod
-    def airflow_str_from_datetime(dt: datetime.datetime) -> str:
-        return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-
     def get_dag_runs(
         self, dag_id: str, start_date: datetime.datetime, end_date: datetime.datetime
     ) -> List["DagRun"]:
         response = self.auth_backend.get_session().get(
             f"{self.get_api_url()}/dags/{dag_id}/dagRuns",
             params={
-                "updated_at_gte": self.airflow_str_from_datetime(start_date),
-                "updated_at_lte": self.airflow_str_from_datetime(end_date),
+                "updated_at_gte": start_date.isoformat(),
+                "updated_at_lte": end_date.isoformat(),
                 "state": ["success"],
             },
         )
@@ -244,8 +219,8 @@ class AirflowInstance:
             f"{self.get_api_url()}/dags/~/dagRuns/list",
             json={
                 "dag_ids": dag_ids,
-                "end_date_gte": self.airflow_str_from_datetime(end_date_gte),
-                "end_date_lte": self.airflow_str_from_datetime(end_date_lte),
+                "end_date_gte": end_date_gte.isoformat(),
+                "end_date_lte": end_date_lte.isoformat(),
                 "order_by": "end_date",
                 "states": ["success"],
                 "page_offset": offset,
@@ -308,19 +283,6 @@ class AirflowInstance:
     def get_run_state(self, dag_id: str, run_id: str) -> str:
         return self.get_dag_run(dag_id, run_id).state
 
-    @staticmethod
-    def timestamp_from_airflow_date(airflow_date: str) -> float:
-        try:
-            return datetime.datetime.strptime(airflow_date, "%Y-%m-%dT%H:%M:%S+00:00").timestamp()
-        except ValueError:
-            return datetime.datetime.strptime(
-                airflow_date, "%Y-%m-%dT%H:%M:%S.%f+00:00"
-            ).timestamp()
-
-    @staticmethod
-    def airflow_date_from_datetime(datetime: datetime.datetime) -> str:
-        return datetime.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-
     def delete_run(self, dag_id: str, run_id: str) -> None:
         response = self.auth_backend.get_session().delete(
             f"{self.get_api_url()}/dags/{dag_id}/dagRuns/{run_id}"
@@ -330,43 +292,6 @@ class AirflowInstance:
                 f"Failed to delete run for {dag_id}/{run_id}. Status code: {response.status_code}, Message: {response.text}"
             )
         return None
-
-
-@record
-class DagInfo:
-    webserver_url: str
-    dag_id: str
-    metadata: Dict[str, Any]
-
-    @property
-    def url(self) -> str:
-        return f"{self.webserver_url}/dags/{self.dag_id}"
-
-    @cached_property
-    def dagster_safe_dag_id(self) -> str:
-        """Name based on the dag_id that is safe to use in dagster."""
-        return convert_to_valid_dagster_name(self.dag_id)
-
-    @property
-    def dag_asset_key(self) -> AssetKey:
-        # Conventional asset key representing a successful run of an airfow dag.
-        return AssetKey(["airflow_instance", "dag", self.dagster_safe_dag_id])
-
-    @property
-    def file_token(self) -> str:
-        return self.metadata["file_token"]
-
-
-@record
-class TaskInfo:
-    webserver_url: str
-    dag_id: str
-    task_id: str
-    metadata: Dict[str, Any]
-
-    @property
-    def dag_url(self) -> str:
-        return f"{self.webserver_url}/dags/{self.dag_id}"
 
 
 @record
@@ -394,12 +319,26 @@ class TaskInstance:
         return f"{self.details_url}&tab=logs"
 
     @property
-    def start_date(self) -> float:
-        return AirflowInstance.timestamp_from_airflow_date(self.metadata["start_date"])
+    def logical_date(self) -> datetime.datetime:
+        """Returns the airflow-coined "logical date" from the task instance metadata.
+        The logical date refers to the starting time of the "data interval" that the overall dag run is processing.
+        In airflow < 2.2, this was set as the execution_date parameter in the task instance metadata.
+        """
+        # In airflow < 2.2, execution_date is set instead of logical_date.
+        logical_date_str = check.not_none(
+            self.metadata.get("logical_date") or self.metadata.get("execution_date"),
+            "Expected one of execution_date or logical_date to be returned from the airflow rest API when querying for task information.",
+        )
+
+        return datetime.datetime.fromisoformat(logical_date_str)
 
     @property
-    def end_date(self) -> float:
-        return AirflowInstance.timestamp_from_airflow_date(self.metadata["end_date"])
+    def start_date(self) -> datetime.datetime:
+        return datetime.datetime.fromisoformat(self.metadata["start_date"])
+
+    @property
+    def end_date(self) -> datetime.datetime:
+        return datetime.datetime.fromisoformat(self.metadata["end_date"])
 
 
 @record
@@ -438,17 +377,23 @@ class DagRun:
         return self.metadata["conf"]
 
     @property
-    def start_date(self) -> float:
-        return AirflowInstance.timestamp_from_airflow_date(self.metadata["start_date"])
+    def logical_date(self) -> datetime.datetime:
+        """Returns the airflow-coined "logical date" from the dag run metadata.
+        The logical date refers to the starting time of the "data interval" that the dag run is processing.
+        In airflow < 2.2, this was set as the execution_date parameter in the dag run metadata.
+        """
+        # In airflow < 2.2, execution_date is set instead of logical_date.
+        logical_date_str = check.not_none(
+            self.metadata.get("logical_date") or self.metadata.get("execution_date"),
+            "Expected one of execution_date or logical_date to be returned from the airflow rest API when querying for dag information.",
+        )
+
+        return datetime.datetime.fromisoformat(logical_date_str)
 
     @property
-    def start_datetime(self) -> datetime.datetime:
-        return datetime.datetime.strptime(self.metadata["start_date"], "%Y-%m-%dT%H:%M:%S+00:00")
+    def start_date(self) -> datetime.datetime:
+        return datetime.datetime.fromisoformat(self.metadata["start_date"])
 
     @property
-    def end_date(self) -> float:
-        return AirflowInstance.timestamp_from_airflow_date(self.metadata["end_date"])
-
-    @property
-    def end_datetime(self) -> datetime.datetime:
-        return datetime.datetime.strptime(self.metadata["end_date"], "%Y-%m-%dT%H:%M:%S+00:00")
+    def end_date(self) -> datetime.datetime:
+        return datetime.datetime.fromisoformat(self.metadata["end_date"])

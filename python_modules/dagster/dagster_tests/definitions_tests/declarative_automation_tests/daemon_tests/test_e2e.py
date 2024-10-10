@@ -5,11 +5,15 @@ from contextlib import contextmanager
 from typing import AbstractSet, Mapping, Sequence, cast
 
 import dagster._check as check
+import pytest
 from dagster import AssetMaterialization, RunsFilter, instance_for_test
+from dagster._core.asset_graph_view.serializable_entity_subset import SerializableEntitySubset
 from dagster._core.definitions.asset_daemon_cursor import AssetDaemonCursor
 from dagster._core.definitions.asset_key import AssetCheckKey, AssetKey
+from dagster._core.definitions.base_asset_graph import BaseAssetGraph
 from dagster._core.definitions.sensor_definition import SensorType
-from dagster._core.remote_representation.external import ExternalSensor
+from dagster._core.execution.backfill import PartitionBackfill
+from dagster._core.remote_representation.external import RemoteSensor
 from dagster._core.remote_representation.origin import InProcessCodeLocationOrigin
 from dagster._core.scheduler.instigation import InstigatorState, SensorInstigatorData
 from dagster._core.storage.dagster_run import DagsterRun
@@ -27,6 +31,7 @@ from dagster._daemon.asset_daemon import (
     AssetDaemon,
     asset_daemon_cursor_from_instigator_serialized_cursor,
 )
+from dagster._daemon.backfill import execute_backfill_iteration
 from dagster._daemon.daemon import get_default_daemon_logger
 from dagster._daemon.sensor import execute_sensor_iteration
 from dagster._time import get_current_datetime
@@ -45,18 +50,16 @@ def get_code_location_origin(filename: str) -> InProcessCodeLocationOrigin:
     )
 
 
-def _get_all_sensors(context: WorkspaceRequestContext) -> Sequence[ExternalSensor]:
+def _get_all_sensors(context: WorkspaceRequestContext) -> Sequence[RemoteSensor]:
     external_sensors = []
     for cl_name in context.get_code_location_entries():
         external_sensors.extend(
-            next(
-                iter(context.get_code_location(cl_name).get_repositories().values())
-            ).get_external_sensors()
+            next(iter(context.get_code_location(cl_name).get_repositories().values())).get_sensors()
         )
     return external_sensors
 
 
-def _get_automation_sensors(context: WorkspaceRequestContext) -> Sequence[ExternalSensor]:
+def _get_automation_sensors(context: WorkspaceRequestContext) -> Sequence[RemoteSensor]:
     return [
         sensor
         for sensor in _get_all_sensors(context)
@@ -126,6 +129,13 @@ def _execute_ticks(
         )
     )
 
+    list(
+        execute_backfill_iteration(
+            context,
+            get_default_daemon_logger("BackfillDaemon"),
+        )
+    )
+
     wait_for_futures(asset_daemon_futures)
     wait_for_futures(sensor_daemon_futures)
 
@@ -134,11 +144,9 @@ def _get_current_state(context: WorkspaceRequestContext) -> Mapping[str, Instiga
     state_by_name = {}
     for sensor in _get_automation_sensors(context):
         state = check.not_none(
-            context.instance.get_instigator_state(
-                sensor.get_external_origin_id(), sensor.selector_id
-            )
+            context.instance.get_instigator_state(sensor.get_remote_origin_id(), sensor.selector_id)
         )
-        state_by_name[f"{sensor.name}_{sensor.get_external_origin_id()}"] = state
+        state_by_name[f"{sensor.name}_{sensor.get_remote_origin_id()}"] = state
     return state_by_name
 
 
@@ -158,23 +166,43 @@ def _get_latest_evaluation_ids(context: WorkspaceProcessContext) -> AbstractSet[
     return {cursor.evaluation_id for cursor in _get_current_cursors(context).values()}
 
 
-def _get_runs_for_latest_ticks(context: WorkspaceProcessContext) -> Sequence[DagsterRun]:
-    run_ids = []
+def _get_reserved_ids_for_latest_ticks(context: WorkspaceProcessContext) -> Sequence[str]:
+    ids = []
     request_context = context.create_request_context()
     for sensor in _get_automation_sensors(request_context):
         ticks = request_context.instance.get_ticks(
-            sensor.get_external_origin_id(),
-            sensor.get_external_origin().get_selector().get_id(),
+            sensor.get_remote_origin_id(),
+            sensor.get_remote_origin().get_selector().get_id(),
             limit=1,
         )
         latest_tick = next(iter(ticks), None)
         if latest_tick and latest_tick.tick_data:
-            run_ids.extend(latest_tick.tick_data.reserved_run_ids or [])
+            ids.extend(latest_tick.tick_data.reserved_run_ids or [])
+    return ids
 
-    if run_ids:
-        return context.instance.get_runs(filters=RunsFilter(run_ids=run_ids))
+
+def _get_runs_for_latest_ticks(context: WorkspaceProcessContext) -> Sequence[DagsterRun]:
+    reserved_ids = _get_reserved_ids_for_latest_ticks(context)
+    if reserved_ids:
+        # return the runs in a stable order to make unit testing easier
+        return sorted(
+            context.instance.get_runs(filters=RunsFilter(run_ids=reserved_ids)),
+            key=lambda r: (sorted(r.asset_selection or []), sorted(r.asset_check_selection or [])),
+        )
     else:
         return []
+
+
+def _get_backfills_for_latest_ticks(
+    context: WorkspaceProcessContext,
+) -> Sequence[PartitionBackfill]:
+    reserved_ids = _get_reserved_ids_for_latest_ticks(context)
+    backfills = []
+    for rid in reserved_ids:
+        backfill = context.instance.get_backfill(rid)
+        if backfill:
+            backfills.append(backfill)
+    return sorted(backfills, key=lambda b: sorted(b.asset_selection))
 
 
 def test_checks_and_assets_in_same_run() -> None:
@@ -259,22 +287,18 @@ def test_cross_location_checks() -> None:
             # should request both checks on processed_files, but one of the checks
             # is in a different code location, so two separate runs should be created
             assert _get_latest_evaluation_ids(context) == {3, 4}
-            runs = sorted(
-                _get_runs_for_latest_ticks(context),
-                key=lambda run: list(run.asset_check_selection or []),
-                reverse=True,
-            )
+            runs = _get_runs_for_latest_ticks(context)
             assert len(runs) == 2
             # in location 1
-            assert runs[0].asset_check_selection == {
+            assert runs[1].asset_check_selection == {
                 AssetCheckKey(AssetKey("processed_files"), "row_count")
             }
-            assert len(runs[0].asset_selection or []) == 0
+            assert len(runs[1].asset_selection or []) == 0
             # in location 2
-            assert runs[1].asset_check_selection == {
+            assert runs[0].asset_check_selection == {
                 AssetCheckKey(AssetKey("processed_files"), "no_nulls")
             }
-            assert len(runs[1].asset_selection or []) == 0
+            assert len(runs[0].asset_selection or []) == 0
 
         time += datetime.timedelta(seconds=30)
         with freeze_time(time):
@@ -305,22 +329,18 @@ def test_cross_location_checks() -> None:
             # can be executed (and row_count also gets executed again because
             # its condition has been set up poorly)
             assert _get_latest_evaluation_ids(context) == {7, 8}
-            runs = sorted(
-                _get_runs_for_latest_ticks(context),
-                key=lambda run: list(run.asset_check_selection or []),
-                reverse=True,
-            )
+            runs = _get_runs_for_latest_ticks(context)
             assert len(runs) == 2
             # in location 1
-            assert runs[0].asset_check_selection == {
+            assert runs[1].asset_check_selection == {
                 AssetCheckKey(AssetKey("processed_files"), "row_count")
             }
-            assert len(runs[0].asset_selection or []) == 0
+            assert len(runs[1].asset_selection or []) == 0
             # in location 2
-            assert runs[1].asset_check_selection == {
+            assert runs[0].asset_check_selection == {
                 AssetCheckKey(AssetKey("processed_files"), "no_nulls")
             }
-            assert len(runs[1].asset_selection or []) == 0
+            assert len(runs[0].asset_selection or []) == 0
 
 
 def test_default_condition() -> None:
@@ -350,12 +370,155 @@ def test_non_subsettable_check() -> None:
     with get_workspace_request_context(
         ["check_not_subsettable"]
     ) as context, get_threadpool_executor() as executor:
-        time = get_current_datetime()
+        time = datetime.datetime(2024, 8, 17, 1, 35)
         with freeze_time(time):
             _execute_ticks(context, executor)
 
             # eager asset materializes
             runs = _get_runs_for_latest_ticks(context)
-            assert len(runs) == 1
-            assert runs[0].asset_selection == {AssetKey("asset_w_check")}
-            assert runs[0].asset_check_selection is None
+            assert len(runs) == 3
+
+            # unpartitioned
+            unpartitioned_run = runs[2]
+            assert unpartitioned_run.tags.get("dagster/partition") is None
+            assert unpartitioned_run.asset_selection == {AssetKey("unpartitioned")}
+            assert unpartitioned_run.asset_check_selection == {
+                AssetCheckKey(AssetKey("unpartitioned"), name="row_count")
+            }
+
+            # static partitioned
+            static_partitioned_run = runs[1]
+            assert static_partitioned_run.tags.get("dagster/partition") == "a"
+            assert static_partitioned_run.asset_selection == {AssetKey("static")}
+            assert static_partitioned_run.asset_check_selection == {
+                AssetCheckKey(AssetKey("static"), name="c1"),
+                AssetCheckKey(AssetKey("static"), name="c2"),
+            }
+
+            # multi-asset time partitioned
+            time_partitioned_run = runs[0]
+            assert time_partitioned_run.tags.get("dagster/partition") == "2024-08-16"
+            assert time_partitioned_run.asset_selection == {
+                AssetKey("a"),
+                AssetKey("b"),
+                AssetKey("c"),
+                AssetKey("d"),
+            }
+            assert time_partitioned_run.asset_check_selection == {
+                AssetCheckKey(AssetKey("a"), name="1"),
+                AssetCheckKey(AssetKey("a"), name="2"),
+                AssetCheckKey(AssetKey("d"), name="3"),
+            }
+
+
+def _get_subsets_by_key(
+    backfill: PartitionBackfill, asset_graph: BaseAssetGraph
+) -> Mapping[AssetKey, SerializableEntitySubset[AssetKey]]:
+    assert backfill.asset_backfill_data is not None
+    target_subset = backfill.asset_backfill_data.target_subset
+    return {s.key: s for s in target_subset.iterate_asset_subsets(asset_graph)}
+
+
+@pytest.mark.skip("Pending change to in_progress() behavior")
+def test_backfill_creation_simple() -> None:
+    with get_workspace_request_context(
+        ["backfill_simple"]
+    ) as context, get_threadpool_executor() as executor:
+        asset_graph = context.create_request_context().asset_graph
+
+        # all start off missing, should be requested
+        time = get_current_datetime()
+        with freeze_time(time):
+            _execute_ticks(context, executor)
+            backfills = _get_backfills_for_latest_ticks(context)
+            assert len(backfills) == 1
+            subsets_by_key = _get_subsets_by_key(backfills[0], asset_graph)
+            assert subsets_by_key.keys() == {
+                AssetKey("A"),
+                AssetKey("B"),
+                AssetKey("C"),
+                AssetKey("D"),
+                AssetKey("E"),
+            }
+
+            assert subsets_by_key[AssetKey("A")].size == 1
+            assert subsets_by_key[AssetKey("B")].size == 3
+            assert subsets_by_key[AssetKey("C")].size == 3
+            assert subsets_by_key[AssetKey("D")].size == 3
+            assert subsets_by_key[AssetKey("E")].size == 1
+
+            # don't create runs
+            runs = _get_runs_for_latest_ticks(context)
+            assert len(runs) == 0
+
+        time += datetime.timedelta(seconds=30)
+        with freeze_time(time):
+            # second tick, don't kick off again
+            _execute_ticks(context, executor)
+            backfills = _get_backfills_for_latest_ticks(context)
+            assert len(backfills) == 0
+            # still don't create runs
+            runs = _get_runs_for_latest_ticks(context)
+            assert len(runs) == 0
+
+
+@pytest.mark.skip("Pending change to in_progress() behavior")
+def test_backfill_with_runs_and_checks() -> None:
+    with get_workspace_request_context(
+        ["backfill_with_runs_and_checks"]
+    ) as context, get_threadpool_executor() as executor:
+        asset_graph = context.create_request_context().asset_graph
+
+        # report materializations for 2/3 of the partitions, resulting in only one
+        # partition needing to be requested
+        context.instance.report_runless_asset_event(AssetMaterialization("run2", partition="x"))
+        context.instance.report_runless_asset_event(AssetMaterialization("run2", partition="y"))
+
+        # all start off missing, should be requested
+        time = get_current_datetime()
+        with freeze_time(time):
+            _execute_ticks(context, executor)
+            # create a backfill for the part of the graph that has multiple partitions
+            # required
+            backfills = _get_backfills_for_latest_ticks(context)
+            assert len(backfills) == 1
+            subsets_by_key = _get_subsets_by_key(backfills[0], asset_graph)
+            assert subsets_by_key.keys() == {
+                AssetKey("backfillA"),
+                AssetKey("backfillB"),
+                AssetKey("backfillC"),
+            }
+
+            assert subsets_by_key[AssetKey("backfillA")].size == 1
+            assert subsets_by_key[AssetKey("backfillB")].size == 3
+            assert subsets_by_key[AssetKey("backfillC")].size == 3
+
+            # create 2 individual runs
+            runs = _get_runs_for_latest_ticks(context)
+            assert len(runs) == 2
+
+            # unpartitioned
+            unpartitioned_run = runs[0]
+            assert unpartitioned_run.tags.get("dagster/partition") is None
+            assert unpartitioned_run.asset_selection == {AssetKey("run1")}
+            assert unpartitioned_run.asset_check_selection == {
+                AssetCheckKey(AssetKey("run1"), name="inside")
+            }
+
+            # static partitioned 1
+            static_partitioned_run = runs[1]
+            assert static_partitioned_run.tags.get("dagster/partition") == "z"
+            assert static_partitioned_run.asset_selection == {AssetKey("run2")}
+            assert static_partitioned_run.asset_check_selection == {
+                AssetCheckKey(AssetKey("run2"), name="inside")
+            }
+
+        time += datetime.timedelta(seconds=30)
+        with freeze_time(time):
+            # second tick, don't kick off again
+            _execute_ticks(context, executor)
+
+            backfills = _get_backfills_for_latest_ticks(context)
+            assert len(backfills) == 0
+            runs = _get_runs_for_latest_ticks(context)
+            assert len(runs) == 0

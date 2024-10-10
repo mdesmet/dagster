@@ -12,18 +12,18 @@ from dagster._core.definitions.run_request import RunRequest
 from dagster._core.definitions.selector import JobSubsetSelector
 from dagster._core.errors import DagsterInvalidSubsetError, DagsterUserCodeProcessError
 from dagster._core.instance import DagsterInstance
-from dagster._core.remote_representation import ExternalExecutionPlan, ExternalJob
+from dagster._core.remote_representation import RemoteExecutionPlan, RemoteJob
 from dagster._core.snap import ExecutionPlanSnapshot
 from dagster._core.storage.dagster_run import DagsterRun, DagsterRunStatus
 from dagster._core.workspace.context import BaseWorkspaceRequestContext, IWorkspaceProcessContext
-from dagster._utils import SingleInstigatorDebugCrashFlags, check_for_debug_crash, hash_collection
+from dagster._utils import SingleInstigatorDebugCrashFlags, check_for_debug_crash
 
 EXECUTION_PLAN_CREATION_RETRIES = 1
 
 
 class RunRequestExecutionData(NamedTuple):
-    external_job: ExternalJob
-    external_execution_plan: ExternalExecutionPlan
+    remote_job: RemoteJob
+    external_execution_plan: RemoteExecutionPlan
 
 
 def _get_implicit_job_name_for_assets(
@@ -58,14 +58,14 @@ def _get_job_execution_data_from_run_request(
     run_request: RunRequest,
     instance: DagsterInstance,
     workspace: BaseWorkspaceRequestContext,
-    run_request_execution_data_cache: Dict[int, RunRequestExecutionData],
+    run_request_execution_data_cache: Dict[JobSubsetSelector, RunRequestExecutionData],
 ) -> RunRequestExecutionData:
     check.invariant(
         len(run_request.entity_keys) > 0,
         "Expected RunRequest to have an asset selection or asset check keys",
     )
-    repo_handle = asset_graph.get_repository_handle(run_request.entity_keys[0])
-    location_name = repo_handle.code_location_origin.location_name
+    handle = asset_graph.get_repository_handle(run_request.entity_keys[0])
+    location_name = handle.location_name
     job_name = (
         _get_implicit_job_name_for_assets(asset_graph, run_request.asset_selection)
         if run_request.asset_selection
@@ -81,33 +81,31 @@ def _get_job_execution_data_from_run_request(
 
     pipeline_selector = JobSubsetSelector(
         location_name=location_name,
-        repository_name=repo_handle.repository_name,
+        repository_name=handle.repository_name,
         job_name=job_name,
         asset_selection=run_request.asset_selection,
         asset_check_selection=run_request.asset_check_keys,
         op_selection=None,
     )
 
-    selector_id = hash_collection(pipeline_selector)
-
-    if selector_id not in run_request_execution_data_cache:
-        code_location = workspace.get_code_location(repo_handle.code_location_origin.location_name)
-        external_job = code_location.get_external_job(pipeline_selector)
+    if pipeline_selector not in run_request_execution_data_cache:
+        code_location = workspace.get_code_location(handle.location_name)
+        remote_job = code_location.get_external_job(pipeline_selector)
 
         external_execution_plan = code_location.get_external_execution_plan(
-            external_job,
+            remote_job,
             {},
             step_keys_to_execute=None,
             known_state=None,
             instance=instance,
         )
 
-        run_request_execution_data_cache[selector_id] = RunRequestExecutionData(
-            external_job,
+        run_request_execution_data_cache[pipeline_selector] = RunRequestExecutionData(
+            remote_job,
             external_execution_plan,
         )
 
-    return run_request_execution_data_cache[selector_id]
+    return run_request_execution_data_cache[pipeline_selector]
 
 
 def _create_asset_run(
@@ -115,7 +113,7 @@ def _create_asset_run(
     run_request: RunRequest,
     run_request_index: int,
     instance: DagsterInstance,
-    run_request_execution_data_cache: Dict[int, RunRequestExecutionData],
+    run_request_execution_data_cache: Dict[JobSubsetSelector, RunRequestExecutionData],
     workspace_process_context: IWorkspaceProcessContext,
     debug_crash_flags: SingleInstigatorDebugCrashFlags,
     logger: logging.Logger,
@@ -191,14 +189,14 @@ def _create_asset_run(
                 should_retry = True
 
         if not should_retry:
-            external_job = check.not_none(execution_data).external_job
+            remote_job = check.not_none(execution_data).remote_job
             external_execution_plan = check.not_none(execution_data).external_execution_plan
 
             run = instance.create_run(
-                job_snapshot=external_job.job_snapshot,
+                job_snapshot=remote_job.job_snapshot,
                 execution_plan_snapshot=external_execution_plan.execution_plan_snapshot,
-                parent_job_snapshot=external_job.parent_job_snapshot,
-                job_name=external_job.name,
+                parent_job_snapshot=remote_job.parent_job_snapshot,
+                job_name=remote_job.name,
                 run_id=run_id,
                 resolved_op_selection=None,
                 op_selection=None,
@@ -208,8 +206,8 @@ def _create_asset_run(
                 root_run_id=None,
                 parent_run_id=None,
                 status=DagsterRunStatus.NOT_STARTED,
-                external_job_origin=external_job.get_external_origin(),
-                job_code_origin=external_job.get_python_origin(),
+                remote_job_origin=remote_job.get_remote_origin(),
+                job_code_origin=remote_job.get_python_origin(),
                 asset_selection=frozenset(run_request.asset_selection)
                 if run_request.asset_selection
                 else None,
@@ -245,7 +243,7 @@ def submit_asset_run(
     run_request_index: int,
     instance: DagsterInstance,
     workspace_process_context: IWorkspaceProcessContext,
-    run_request_execution_data_cache: Dict[int, RunRequestExecutionData],
+    run_request_execution_data_cache: Dict[JobSubsetSelector, RunRequestExecutionData],
     debug_crash_flags: SingleInstigatorDebugCrashFlags,
     logger: logging.Logger,
 ) -> DagsterRun:

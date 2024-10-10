@@ -104,7 +104,7 @@ class BaseAssetNode(BaseEntityNode[AssetKey]):
 
     @property
     def child_entity_keys(self) -> AbstractSet[EntityKey]:
-        return self.parent_keys | self.check_keys
+        return self.child_keys | self.check_keys
 
     @property
     def has_self_dependency(self) -> bool:
@@ -180,7 +180,7 @@ class BaseAssetNode(BaseEntityNode[AssetKey]):
 
     @property
     @abstractmethod
-    def execution_set_asset_and_check_keys(
+    def execution_set_entity_keys(
         self,
     ) -> AbstractSet[Union[AssetKey, AssetCheckKey]]: ...
 

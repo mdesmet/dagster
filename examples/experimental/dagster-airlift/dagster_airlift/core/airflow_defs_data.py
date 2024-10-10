@@ -1,44 +1,55 @@
-from typing import AbstractSet, List, Optional
+from collections import defaultdict
+from functools import cached_property
+from typing import AbstractSet, Mapping, Set
 
-from dagster import AssetKey, AssetsDefinition, AssetSpec, external_asset_from_spec
+from dagster import AssetKey, Definitions
 from dagster._record import record
-from dagster._serdes.serdes import whitelist_for_serdes
 
-from dagster_airlift.core.serialization.serialized_data import SerializedAirflowDefinitionsData
+from dagster_airlift.constants import DAG_MAPPING_METADATA_KEY
+from dagster_airlift.core.airflow_instance import AirflowInstance
+from dagster_airlift.core.serialization.compute import AirliftMetadataMappingInfo
+from dagster_airlift.core.serialization.serialized_data import TaskHandle
+from dagster_airlift.core.utils import is_mapped_asset_spec, task_handles_for_spec
 
 
-@whitelist_for_serdes
 @record
 class AirflowDefinitionsData:
-    instance_name: str
-    serialized_data: SerializedAirflowDefinitionsData
-
-    def map_airflow_data_to_spec(self, spec: AssetSpec) -> AssetSpec:
-        """If there is airflow data applicable to the asset key, transform the spec and apply the data."""
-        existing_key_data = self.serialized_data.key_scope_data_map.get(spec.key)
-        return spec if not existing_key_data else existing_key_data.apply_to_spec(spec)
-
-    def construct_dag_assets_defs(self) -> List[AssetsDefinition]:
-        return [
-            external_asset_from_spec(dag_data.spec_data.to_asset_spec())
-            for dag_data in self.serialized_data.dag_datas.values()
-        ]
+    airflow_instance: AirflowInstance
+    mapped_defs: Definitions
 
     @property
-    def all_dag_ids(self) -> AbstractSet[str]:
-        return set(self.serialized_data.dag_datas.keys())
+    def instance_name(self) -> str:
+        return self.airflow_instance.name
 
-    def asset_key_for_dag(self, dag_id: str) -> AssetKey:
-        return self.serialized_data.dag_datas[dag_id].spec_data.asset_key
+    @cached_property
+    def mapping_info(self) -> AirliftMetadataMappingInfo:
+        return AirliftMetadataMappingInfo(asset_specs=list(self.mapped_defs.get_all_asset_specs()))
 
-    def task_ids_in_dag(self, dag_id: str) -> AbstractSet[str]:
-        return set(self.serialized_data.dag_datas[dag_id].task_handle_data.keys())
+    def task_ids_in_dag(self, dag_id: str) -> Set[str]:
+        return self.mapping_info.task_id_map[dag_id]
 
-    def migration_state_for_task(self, dag_id: str, task_id: str) -> Optional[bool]:
-        return self.serialized_data.dag_datas[dag_id].task_handle_data[task_id].migration_state
+    @property
+    def dag_ids_with_mapped_asset_keys(self) -> AbstractSet[str]:
+        return self.mapping_info.dag_ids
+
+    @cached_property
+    def asset_keys_per_task_handle(self) -> Mapping[TaskHandle, AbstractSet[AssetKey]]:
+        asset_keys_per_handle = defaultdict(set)
+        for spec in self.mapped_defs.get_all_asset_specs():
+            if is_mapped_asset_spec(spec):
+                task_handles = task_handles_for_spec(spec)
+                for task_handle in task_handles:
+                    asset_keys_per_handle[task_handle].add(spec.key)
+        return asset_keys_per_handle
+
+    @cached_property
+    def asset_keys_per_dag(self) -> Mapping[str, AbstractSet[AssetKey]]:
+        dag_id_to_asset_key = defaultdict(set)
+        for spec in self.mapped_defs.get_all_asset_specs():
+            if DAG_MAPPING_METADATA_KEY in spec.metadata:
+                for mapping in spec.metadata[DAG_MAPPING_METADATA_KEY]:
+                    dag_id_to_asset_key[mapping["dag_id"]].add(spec.key)
+        return dag_id_to_asset_key
 
     def asset_keys_in_task(self, dag_id: str, task_id: str) -> AbstractSet[AssetKey]:
-        return self.serialized_data.dag_datas[dag_id].task_handle_data[task_id].asset_keys_in_task
-
-    def topo_order_index(self, asset_key: AssetKey) -> int:
-        return self.serialized_data.asset_key_topological_ordering.index(asset_key)
+        return self.asset_keys_per_task_handle[TaskHandle(dag_id=dag_id, task_id=task_id)]

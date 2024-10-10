@@ -1,8 +1,19 @@
+import os
 import pickle
-import sys
 from abc import ABC, abstractmethod
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, Sequence, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generic,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+    Union,
+)
 
 import pytest
 from dagster._check.functions import CheckError
@@ -10,11 +21,13 @@ from dagster._record import (
     _INJECTED_DEFAULT_VALS_LOCAL_VAR,
     IHaveNew,
     ImportFrom,
+    LegacyNamedTupleMixin,
     build_args_and_assignment_strs,
     check,
     copy,
     record,
     record_custom,
+    replace,
 )
 from dagster._serdes.serdes import deserialize_value, serialize_value, whitelist_for_serdes
 from dagster._utils import hash_collection
@@ -45,16 +58,16 @@ def test_runtime_typecheck() -> None:
 
 
 def test_override_constructor_in_subclass() -> None:
-    @record
-    class MyClass:
+    @record_custom
+    class MyClass(IHaveNew):
         foo: str
         bar: int
 
         def __new__(cls, foo: str, bar: int):
             return super().__new__(
                 cls,
-                foo=foo,  # type: ignore
-                bar=bar,  # type: ignore
+                foo=foo,
+                bar=bar,
             )
 
     assert MyClass(foo="fdsjk", bar=4)
@@ -546,7 +559,6 @@ def test_generic() -> None:
     assert IntThings(things=[1, 2]).first_thing == 1
 
 
-@pytest.mark.skipif(sys.version_info < (3, 10), reason="py38/py39 weirdness")
 def test_generic_nested() -> None:
     T = TypeVar("T")
 
@@ -642,7 +654,6 @@ def test_subclass_propagate_change_defaults() -> None:
     assert repr(subsub) == "SubSub(a=0, b=0, c=-1, d=2)"
 
 
-@pytest.mark.skipif(sys.version_info < (3, 10), reason="py38/py39 weirdness")
 def test_generic_with_propagate() -> None:
     T = TypeVar("T")
 
@@ -707,7 +718,6 @@ def test_generic_with_propagate() -> None:
     assert copy(obj, label="...").label == "..."
 
 
-@pytest.mark.skipif(sys.version_info < (3, 10), reason="py38/py39 weirdness")
 def test_generic_with_propagate_type_checking() -> None:
     T = TypeVar("T")
 
@@ -745,7 +755,6 @@ def test_generic_with_propagate_type_checking() -> None:
         copy(valid_record, val4=4)
 
 
-@pytest.mark.xfail()
 def test_custom_subclass() -> None:
     @record_custom
     class Thing(IHaveNew):
@@ -756,9 +765,68 @@ def test_custom_subclass() -> None:
 
     assert Thing(val_short="abc").val == "abcabc"
 
-    @record
-    class SubThing(Thing):
-        other_val: int
+    with pytest.raises(
+        CheckError,
+        match=r"@record can not inherit from @record_custom",
+    ):
 
-    # this does not work, as we've overridden the wrong __new__
-    SubThing(other_val=1)
+        @record
+        class SubThing(Thing):
+            other_val: int
+
+
+def test_replace() -> None:
+    class NTExample(NamedTuple("_NT", [("name", str)])):
+        def __new__(cls, name: str):
+            check.invariant(name != "bad")
+            return super().__new__(
+                cls,
+                name=name,
+            )
+
+    obj = NTExample("good")
+    assert obj._asdict() == {"name": "good"}
+    # namedtuple._replace bypasses NTExample.__new__
+    assert obj._replace(name="bad")
+    assert obj._replace(name="good") == obj
+    assert obj._replace(name="foo").__class__ is obj.__class__
+
+    @record_custom
+    class Legacy(IHaveNew, LegacyNamedTupleMixin):
+        name: str
+
+        def __new__(cls, name: str):
+            check.invariant(name != "bad")
+            return super().__new__(
+                cls,
+                name=name,
+            )
+
+    obj = Legacy("good")
+    assert obj._asdict() == {"name": "good"}
+    # legacy _replace avoids __new__
+    assert obj._replace(name="bad")
+    assert obj._replace(name="good") == obj
+    assert obj._replace(name="foo").__class__ is obj.__class__
+
+    @record
+    class Parent:
+        one: int
+
+    @record
+    class Child(Parent):
+        two: int
+
+        def boop(self):
+            return "boop"
+
+    obj = Child(one=1, two=2)
+    replaced = replace(obj, two=2)
+    assert replaced == obj
+    replaced.boop()
+    assert replaced.__class__ is obj.__class__
+
+
+def test_defensive_checks_running():
+    # make sure we have enabled defensive checks in test, ideally as broadly as possible
+    assert os.getenv("DAGSTER_RECORD_DEFENSIVE_CHECKS") == "true"
